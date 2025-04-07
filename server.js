@@ -6,15 +6,14 @@ const cors = require("cors");
 
 const app = express();
 app.use(cors());
-app.use(bodyParser.urlencoded({ extended: true })); // ✅ Required for Unity's WWWForm
-app.use(bodyParser.json());                         // ✅ JSON support
+app.use(bodyParser.urlencoded({ extended: true }));
+app.use(bodyParser.json());
 
-// Connect to MongoDB
 mongoose.connect(process.env.MONGO_URI)
   .then(() => console.log("✅ Connected to MongoDB"))
   .catch(err => console.error("❌ MongoDB Error:", err));
 
-// License schema
+// Updated schema with deviceIds
 const LicenseSchema = new mongoose.Schema({
   key: { type: String, required: true, unique: true },
   userId: { type: String, required: true },
@@ -23,6 +22,7 @@ const LicenseSchema = new mongoose.Schema({
   maxActivations: { type: Number, default: 3 },
   activations: { type: Number, default: 0 },
   isValid: { type: Boolean, default: true },
+  deviceIds: [String], // ✅ NEW FIELD
 });
 
 const License = mongoose.model("License", LicenseSchema);
@@ -41,6 +41,7 @@ app.post("/generate-license", async (req, res) => {
     userId,
     email,
     name,
+    deviceIds: [],
   });
 
   await newLicense.save();
@@ -51,15 +52,14 @@ function generateKey() {
   return "LIC-" + Math.random().toString(36).substr(2, 16).toUpperCase();
 }
 
-// ✅ Unity-compatible license verification
+// ✅ Improved license verification with per-device tracking
 app.post("/verify-license", async (req, res) => {
   try {
-    const { key, deviceId } = req.body || {}; // ⛑️ Safe destructuring
+    const { key, deviceId } = req.body || {};
 
     console.log("🔍 Incoming verify request:", req.body);
 
     if (!key || !deviceId) {
-      console.warn("⚠️ Missing key or deviceId");
       return res.status(400).json({ valid: false, message: "Missing key or device ID." });
     }
 
@@ -69,15 +69,22 @@ app.post("/verify-license", async (req, res) => {
       return res.status(400).json({ valid: false, message: "Invalid or deactivated license key." });
     }
 
-    if (license.activations >= license.maxActivations) {
-      return res.status(403).json({ valid: false, message: "Activation limit reached." });
+    if (!license.deviceIds.includes(deviceId)) {
+      if (license.activations >= license.maxActivations) {
+        console.log("❌ Activation limit reached for key:", key);
+        return res.status(403).json({ valid: false, message: "Activation limit reached." });
+      }
+
+      license.deviceIds.push(deviceId);
+      license.activations += 1;
+      await license.save();
+
+      console.log(`✅ New device activated. Total activations: ${license.activations}`);
+    } else {
+      console.log("✅ Device already verified — no activation used.");
     }
 
-    license.activations += 1;
-    await license.save();
-
-    console.log(`✅ License verified. Activations: ${license.activations}`);
-    res.json({ valid: true, message: "License verified." });
+    return res.json({ valid: true, message: "License verified." });
   } catch (err) {
     console.error("❌ Server error on /verify-license:", err);
     res.status(500).json({ valid: false, message: "Server error." });
