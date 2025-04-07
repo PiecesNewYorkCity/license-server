@@ -31,16 +31,16 @@ async function sendLicenseEmail(to, name, licenseKeys, product) {
   const html = `
     <h2>Hi ${name || "there"},</h2>
     <p>Thanks for your purchase of <strong>${product}</strong>!</p>
-    <p>Here ${licenseKeys.length === 1 ? "is" : "are"} your license key${licenseKeys.length > 1 ? "s" : ""}:</p>
+    <p>Your license key:</p>
     <pre style="font-size: 18px; background: #eee; padding: 10px;">${keyList}</pre>
-    <p>Use each key to activate a copy of the game.</p>
-    <p>— Your Game Team</p>
+    <p>Enter this in the game to activate your copy.</p>
+    <p>— Pieces</p>
   `;
 
   await transporter.sendMail({
-    from: `"Your Game Store" <${process.env.GMAIL_USER}>`,
+    from: `"Pieces" <${process.env.GMAIL_USER}>`,
     to,
-    subject: `Your License Key(s) for ${product}`,
+    subject: `Your License Key for ${product}`,
     html,
   });
 
@@ -71,42 +71,51 @@ imap.once("ready", () => {
             const body = parsed.text || "";
             const from = parsed.from?.text;
 
+            // 🔍 Extract customer email/name from Customer Information section
             const customerSection = body.match(/Customer Information([\s\S]*?)Order Summary/i);
             const customerEmailMatch = customerSection?.[1]?.match(/([a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,})/);
-            const buyerEmail = customerEmailMatch?.[1]?.trim();
+            const customerNameLine = customerSection?.[1]?.split(/\n|,/).map(l => l.trim()).filter(Boolean)?.[0];
 
-            let buyerName = null;
-            if (customerSection?.[1]) {
-              const lines = customerSection[1].split(/\n|,/).map(l => l.trim()).filter(Boolean);
-              buyerName = lines[0];
-            }
+            const buyerEmail = customerEmailMatch?.[1]?.trim() || parsed.from?.value?.[0]?.address || "unknown@example.com";
+            const buyerName = customerNameLine || parsed.from?.value?.[0]?.name || "Customer";
 
-            const orderIdMatch = body.match(/Order\s*(?:No\.?|#:?)\s*(\d+)/i);
+            // 🧾 Flexible Order ID matcher with fallback to subject line
+            const orderIdMatch = body.match(/Order\s*(?:No\.?|#:?)?\s*(\d{5,})/i) || parsed.subject?.match(/#(\d{5,})/);
             const orderId = orderIdMatch?.[1]?.trim();
 
-            // 🛍 Parse all product lines from order summary
+            // 🛍 Check if "Land of Love" is present in order summary
             const orderSummaryMatch = body.match(/Item Desc\s+Quantity\s+Total([\s\S]*?)Subtotal/i);
-            let landOfLoveQuantity = 0;
+            let landOfLoveFound = false;
 
             if (orderSummaryMatch?.[1]) {
               const lines = orderSummaryMatch[1]
-                .split("\n")
+                .split(/\r?\n/)
                 .map(line => line.trim())
                 .filter(Boolean);
 
-              for (let i = 0; i < lines.length; i++) {
-                if (/land of love/i.test(lines[i])) {
-                  const qtyLine = lines[i + 1]?.trim();
-                  const qtyMatch = qtyLine?.match(/^(\d+)/);
-                  const qty = qtyMatch ? parseInt(qtyMatch[1]) : 1;
-                  landOfLoveQuantity = qty;
+              console.log("📦 Raw Order Summary Lines:");
+              lines.forEach((line, i) => {
+                console.log(`${i}: ${JSON.stringify(line)}`);
+              });
+
+              for (let line of lines) {
+                if (/land of love/i.test(line)) {
+                  landOfLoveFound = true;
+                  console.log("🧪 Found 'Land of Love' in line:", line);
                   break;
                 }
               }
             }
 
-            if (!buyerEmail || !orderId || landOfLoveQuantity === 0) {
-              console.log("⚠️ Could not extract valid product or quantity.");
+            // ✅ Log values to confirm parsing success
+            console.log("🔎 Check values:");
+            console.log("Order ID:", orderId);
+            console.log("Email:", buyerEmail);
+            console.log("Name:", buyerName);
+            console.log("Found Land of Love:", landOfLoveFound);
+
+            if (!buyerEmail || !orderId || !landOfLoveFound) {
+              console.log("⚠️ Could not extract valid order or product.");
               return;
             }
 
@@ -114,48 +123,39 @@ imap.once("ready", () => {
             console.log("🧾 Order #:", orderId);
             console.log("🧑 Customer:", buyerName);
             console.log("📧 Email:", buyerEmail);
-            console.log(`🎯 Land of Love Quantity: ${landOfLoveQuantity}`);
 
             const licenseKeys = [];
+            const subOrderId = `${orderId}-1`;
 
-            for (let i = 0; i < landOfLoveQuantity; i++) {
-              const subOrderId = `${orderId}-${i + 1}`;
+            console.log("📡 Calling:", process.env.LICENSE_API);
+            console.log("📦 Payload:", {
+              userId: subOrderId,
+              email: buyerEmail,
+              name: buyerName,
+            });
 
-              console.log("📡 Calling:", process.env.LICENSE_API);
-              console.log("📦 Payload:", {
+            try {
+              const response = await axios.post(process.env.LICENSE_API, {
                 userId: subOrderId,
                 email: buyerEmail,
                 name: buyerName,
               });
 
-              try {
-                const response = await axios.post(process.env.LICENSE_API, {
-                  userId: subOrderId,
-                  email: buyerEmail,
-                  name: buyerName,
-                });
+              const { licenseKey, existing } = response.data;
 
-                const { licenseKey, existing } = response.data;
-
-                if (existing) {
-                  console.log(`♻️ License already exists for ${subOrderId}. Skipping.`);
-                } else {
-                  console.log(`🎟️ License key generated for ${subOrderId}: ${licenseKey}`);
-                  licenseKeys.push(licenseKey);
-                }
-              } catch (err) {
-                if (err.response) {
-                  console.error("❌ License generation failed:", err.response.status, err.response.data);
-                } else {
-                  console.error("❌ License generation failed:", err.message);
-                }
+              if (existing) {
+                console.log(`♻️ License already exists for ${subOrderId}. Skipping email.`);
+              } else {
+                console.log(`🎟️ License key generated: ${licenseKey}`);
+                licenseKeys.push(licenseKey);
+                await sendLicenseEmail(buyerEmail, buyerName, licenseKeys, "Land of Love");
               }
-            }
-
-            if (licenseKeys.length > 0) {
-              await sendLicenseEmail(buyerEmail, buyerName, licenseKeys, "Land of Love");
-            } else {
-              console.log("🚫 No new licenses generated. Email not sent.");
+            } catch (err) {
+              if (err.response) {
+                console.error("❌ License generation failed:", err.response.status, err.response.data);
+              } else {
+                console.error("❌ License generation failed:", err.message);
+              }
             }
           });
         });
